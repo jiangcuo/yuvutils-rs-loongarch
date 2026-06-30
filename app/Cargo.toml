@@ -16,6 +16,7 @@ nightly_i8mm = ["yuv/nightly_i8mm"]
 fast_mode = ["yuv/fast_mode"]
 rdm = ["yuv/rdm"]
 professional_mode = ["yuv/professional_mode"]
+loongarch_bench = ["yuv/loongarch_bench"]
 
 [dev-dependencies]
 criterion = "0.6"
@@ -34,4 +35,8 @@ harness = false
 
 [[bench]]
 name = "rdp"
+harness = false
+
+[[bench]]
+name = "loongarch_rgb_to_yuv"
 harness = false

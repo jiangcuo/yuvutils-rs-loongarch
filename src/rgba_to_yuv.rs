@@ -35,6 +35,8 @@ use crate::avx512bw::{avx512_rgba_to_yuv, avx512_rgba_to_yuv420};
 use crate::internals::*;
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 use crate::neon::{neon_rgba_to_yuv, neon_rgba_to_yuv420};
+#[cfg(target_arch = "loongarch64")]
+use crate::loongarch64::loongarch64_rgba_to_yuv420;
 use crate::yuv_error::check_rgba_destination;
 #[allow(unused_imports)]
 use crate::yuv_support::*;
@@ -410,6 +412,16 @@ impl<const ORIGIN_CHANNELS: u8, const SAMPLING: u8, const PRECISION: i32> Defaul
             return RgbEncoder420 { handler: None };
         }
         assert_eq!(PRECISION, 13);
+        #[cfg(target_arch = "loongarch64")]
+        {
+            if std::arch::is_loongarch_feature_detected!("lasx")
+                || std::arch::is_loongarch_feature_detected!("lsx")
+            {
+                return RgbEncoder420 {
+                    handler: Some(loongarch64_rgba_to_yuv420::<ORIGIN_CHANNELS, PRECISION>),
+                };
+            }
+        }
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
         {
             #[cfg(feature = "rdm")]
@@ -664,6 +676,62 @@ impl<const ORIGIN_CHANNELS: u8, const SAMPLING: u8, const PRECISION: i32> Defaul
 
 #[cfg(feature = "fast_mode")]
 impl_wide_row_forward_handler!(RgbEncoderFast420);
+
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_bench"))]
+struct ForcedRgbEncoder420 {
+    handler: RgbEncoder420Handler,
+}
+
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_bench"))]
+impl WideRowForwardHandler<u8, i32> for ForcedRgbEncoder420 {
+    fn handle_row(
+        &self,
+        _y_plane: &mut [u8],
+        _u_plane: &mut [u8],
+        _v_plane: &mut [u8],
+        _rgba: &[u8],
+        _width: u32,
+        _chroma: YuvChromaRange,
+        _transform: &CbCrForwardTransform<i32>,
+    ) -> ProcessedOffset {
+        ProcessedOffset { cx: 0, ux: 0 }
+    }
+}
+
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_bench"))]
+impl WideRowForward420Handler<u8, i32> for ForcedRgbEncoder420 {
+    fn handle_row(
+        &self,
+        y_plane0: &mut [u8],
+        y_plane1: &mut [u8],
+        u_plane: &mut [u8],
+        v_plane: &mut [u8],
+        rgba0: &[u8],
+        rgba1: &[u8],
+        width: u32,
+        chroma: YuvChromaRange,
+        transform: &CbCrForwardTransform<i32>,
+    ) -> ProcessedOffset {
+        if let Some(handler) = self.handler {
+            unsafe {
+                return handler(
+                    transform,
+                    &chroma,
+                    y_plane0,
+                    y_plane1,
+                    u_plane,
+                    v_plane,
+                    rgba0,
+                    rgba1,
+                    0,
+                    0,
+                    width as usize,
+                );
+            }
+        }
+        ProcessedOffset { cx: 0, ux: 0 }
+    }
+}
 
 fn rgbx_to_yuv8_impl<const ORIGIN_CHANNELS: u8, const SAMPLING: u8, const PRECISION: i32>(
     image: &mut YuvPlanarImageMut<u8>,
@@ -1027,6 +1095,102 @@ fn rgbx_to_yuv8_impl<const ORIGIN_CHANNELS: u8, const SAMPLING: u8, const PRECIS
     Ok(())
 }
 
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_bench"))]
+fn rgbx_to_yuv420_forced<const ORIGIN_CHANNELS: u8>(
+    planar_image: &mut YuvPlanarImageMut<u8>,
+    rgba: &[u8],
+    rgba_stride: u32,
+    range: YuvRange,
+    matrix: YuvStandardMatrix,
+    handler: RgbEncoder420Handler,
+) -> Result<(), YuvError> {
+    rgbx_to_yuv8_impl::<
+        ORIGIN_CHANNELS,
+        { YuvChromaSubsampling::Yuv420 as u8 },
+        13,
+    >(
+        planar_image,
+        rgba,
+        rgba_stride,
+        range,
+        matrix,
+        ForcedRgbEncoder420 { handler: None },
+        ForcedRgbEncoder420 { handler },
+    )
+}
+
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_bench"))]
+#[doc(hidden)]
+pub fn bgra_to_yuv420_scalar(
+    planar_image: &mut YuvPlanarImageMut<u8>,
+    bgra: &[u8],
+    bgra_stride: u32,
+    range: YuvRange,
+    matrix: YuvStandardMatrix,
+) -> Result<(), YuvError> {
+    rgbx_to_yuv420_forced::<{ YuvSourceChannels::Bgra as u8 }>(
+        planar_image,
+        bgra,
+        bgra_stride,
+        range,
+        matrix,
+        None,
+    )
+}
+
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_bench"))]
+#[doc(hidden)]
+pub fn bgra_to_yuv420_lsx(
+    planar_image: &mut YuvPlanarImageMut<u8>,
+    bgra: &[u8],
+    bgra_stride: u32,
+    range: YuvRange,
+    matrix: YuvStandardMatrix,
+) -> Result<(), YuvError> {
+    bgra_to_yuv420_8bit(planar_image, bgra, bgra_stride, range, matrix, crate::loongarch64::Simd8::Lsx)
+}
+
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_bench"))]
+#[doc(hidden)]
+pub fn bgra_to_yuv420_lasx(
+    planar_image: &mut YuvPlanarImageMut<u8>,
+    bgra: &[u8],
+    bgra_stride: u32,
+    range: YuvRange,
+    matrix: YuvStandardMatrix,
+) -> Result<(), YuvError> {
+    bgra_to_yuv420_8bit(planar_image, bgra, bgra_stride, range, matrix, crate::loongarch64::Simd8::Lasx)
+}
+
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_bench"))]
+fn bgra_to_yuv420_8bit(
+    planar_image: &mut YuvPlanarImageMut<u8>,
+    bgra: &[u8],
+    bgra_stride: u32,
+    range: YuvRange,
+    matrix: YuvStandardMatrix,
+    backend: crate::loongarch64::Simd8,
+) -> Result<(), YuvError> {
+    let c = crate::loongarch64::coeffs8(matrix, range)
+        .expect("loongarch_bench uses a libyuv-tabulated matrix/range");
+    check_rgba_destination(
+        bgra,
+        bgra_stride,
+        planar_image.width,
+        planar_image.height,
+        YuvSourceChannels::Bgra.get_channels_count(),
+    )?;
+    planar_image.check_constraints(YuvChromaSubsampling::Yuv420)?;
+    crate::loongarch64::rgba_to_i420_8::<{ YuvSourceChannels::Bgra as u8 }>(
+        planar_image,
+        bgra,
+        bgra_stride,
+        &c,
+        backend,
+    );
+    Ok(())
+}
+
 fn rgbx_to_yuv8<const ORIGIN_CHANNELS: u8, const SAMPLING: u8>(
     image: &mut YuvPlanarImageMut<u8>,
     rgba: &[u8],
@@ -1375,6 +1539,33 @@ pub fn bgra_to_yuv420(
     matrix: YuvStandardMatrix,
     mode: YuvConversionMode,
 ) -> Result<(), YuvError> {
+    // On LoongArch the generic path runs at 13-bit and is compute-bound; for the
+    // matrices libyuv tabulates we use its much faster 8-bit kernel instead
+    // (whole frame at 8-bit, so no precision seam). Falls back otherwise.
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let _ = mode;
+        if let Some(c) = crate::loongarch64::coeffs8(matrix, range) {
+            if std::arch::is_loongarch_feature_detected!("lsx") {
+                check_rgba_destination(
+                    bgra,
+                    bgra_stride,
+                    planar_image.width,
+                    planar_image.height,
+                    YuvSourceChannels::Bgra.get_channels_count(),
+                )?;
+                planar_image.check_constraints(YuvChromaSubsampling::Yuv420)?;
+                crate::loongarch64::rgba_to_i420_8::<{ YuvSourceChannels::Bgra as u8 }>(
+                    planar_image,
+                    bgra,
+                    bgra_stride,
+                    &c,
+                    crate::loongarch64::Simd8::Auto,
+                );
+                return Ok(());
+            }
+        }
+    }
     rgbx_to_yuv8::<{ YuvSourceChannels::Bgra as u8 }, { YuvChromaSubsampling::Yuv420 as u8 }>(
         planar_image,
         bgra,

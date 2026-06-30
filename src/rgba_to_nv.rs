@@ -37,6 +37,8 @@ use crate::internals::{
 };
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 use crate::neon::{neon_rgbx_to_nv_row, neon_rgbx_to_nv_row420};
+#[cfg(target_arch = "loongarch64")]
+use crate::loongarch64::loongarch64_rgba_to_nv420;
 use crate::yuv_error::check_rgba_destination;
 use crate::yuv_support::*;
 use crate::YuvError;
@@ -116,6 +118,18 @@ impl<const ORIGIN_CHANNELS: u8, const UV_ORDER: u8, const SAMPLING: u8, const PR
         }
         assert_eq!(PRECISION, 13);
         assert_eq!(chroma_subsampling, YuvChromaSubsampling::Yuv420);
+        #[cfg(target_arch = "loongarch64")]
+        {
+            if std::arch::is_loongarch_feature_detected!("lasx")
+                || std::arch::is_loongarch_feature_detected!("lsx")
+            {
+                return SemiPlanar420Encoder {
+                    handler: Some(
+                        loongarch64_rgba_to_nv420::<ORIGIN_CHANNELS, UV_ORDER, PRECISION>,
+                    ),
+                };
+            }
+        }
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
         {
             #[cfg(feature = "rdm")]
@@ -349,6 +363,50 @@ define_biplanar420_handler!(SemiPlanar420Encoder);
 define_biplanar420_handler!(SemiPlanar420EncoderFast);
 #[cfg(feature = "professional_mode")]
 define_biplanar420_handler!(SemiPlanar420EncoderProfessional);
+
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_bench"))]
+struct ForcedSemiPlanar420Encoder {
+    handler: SemiPlanarRowHandler,
+}
+
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_bench"))]
+impl WideRowForwardBiPlanar420Handler<u8, i32> for ForcedSemiPlanar420Encoder {
+    fn handle_rows(
+        &self,
+        rgba0: &[u8],
+        rgba1: &[u8],
+        y_plane0: &mut [u8],
+        y_plane1: &mut [u8],
+        uv_plane: &mut [u8],
+        width: u32,
+        chroma: YuvChromaRange,
+        transform: &CbCrForwardTransform<i32>,
+    ) -> ProcessedOffset {
+        if let Some(handler) = self.handler {
+            unsafe {
+                return handler(
+                    y_plane0, y_plane1, uv_plane, rgba0, rgba1, width, &chroma, transform, 0, 0,
+                );
+            }
+        }
+        ProcessedOffset { cx: 0, ux: 0 }
+    }
+}
+
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_bench"))]
+impl WideRowForwardBiPlanarHandler<u8, i32> for ForcedSemiPlanar420Encoder {
+    fn handle_row(
+        &self,
+        _rgba: &[u8],
+        _y_plane: &mut [u8],
+        _uv_plane: &mut [u8],
+        _width: u32,
+        _chroma: YuvChromaRange,
+        _transform: &CbCrForwardTransform<i32>,
+    ) -> ProcessedOffset {
+        ProcessedOffset { cx: 0, ux: 0 }
+    }
+}
 
 struct SemiPlanarEncoder<
     const ORIGIN_CHANNELS: u8,
@@ -917,6 +975,100 @@ fn rgbx_to_nv_impl<
     Ok(())
 }
 
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_bench"))]
+fn rgbx_to_nv420_forced<const ORIGIN_CHANNELS: u8, const UV_ORDER: u8>(
+    image: &mut YuvBiPlanarImageMut<u8>,
+    rgba: &[u8],
+    rgba_stride: u32,
+    range: YuvRange,
+    matrix: YuvStandardMatrix,
+    handler: SemiPlanarRowHandler,
+) -> Result<(), YuvError> {
+    rgbx_to_nv_impl::<
+        ORIGIN_CHANNELS,
+        UV_ORDER,
+        { YuvChromaSubsampling::Yuv420 as u8 },
+        13,
+    >(
+        image,
+        rgba,
+        rgba_stride,
+        range,
+        matrix,
+        ForcedSemiPlanar420Encoder { handler: None },
+        ForcedSemiPlanar420Encoder { handler },
+    )
+}
+
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_bench"))]
+#[doc(hidden)]
+pub fn bgra_to_yuv_nv12_scalar(
+    image: &mut YuvBiPlanarImageMut<u8>,
+    bgra: &[u8],
+    bgra_stride: u32,
+    range: YuvRange,
+    matrix: YuvStandardMatrix,
+) -> Result<(), YuvError> {
+    rgbx_to_nv420_forced::<{ YuvSourceChannels::Bgra as u8 }, { YuvNVOrder::UV as u8 }>(
+        image,
+        bgra,
+        bgra_stride,
+        range,
+        matrix,
+        None,
+    )
+}
+
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_bench"))]
+#[doc(hidden)]
+pub fn bgra_to_yuv_nv12_lsx(
+    image: &mut YuvBiPlanarImageMut<u8>,
+    bgra: &[u8],
+    bgra_stride: u32,
+    range: YuvRange,
+    matrix: YuvStandardMatrix,
+) -> Result<(), YuvError> {
+    bgra_to_yuv_nv12_8bit(image, bgra, bgra_stride, range, matrix, crate::loongarch64::Simd8::Lsx)
+}
+
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_bench"))]
+#[doc(hidden)]
+pub fn bgra_to_yuv_nv12_lasx(
+    image: &mut YuvBiPlanarImageMut<u8>,
+    bgra: &[u8],
+    bgra_stride: u32,
+    range: YuvRange,
+    matrix: YuvStandardMatrix,
+) -> Result<(), YuvError> {
+    bgra_to_yuv_nv12_8bit(image, bgra, bgra_stride, range, matrix, crate::loongarch64::Simd8::Lasx)
+}
+
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_bench"))]
+fn bgra_to_yuv_nv12_8bit(
+    image: &mut YuvBiPlanarImageMut<u8>,
+    bgra: &[u8],
+    bgra_stride: u32,
+    range: YuvRange,
+    matrix: YuvStandardMatrix,
+    backend: crate::loongarch64::Simd8,
+) -> Result<(), YuvError> {
+    let c = crate::loongarch64::coeffs8(matrix, range)
+        .expect("loongarch_bench uses a libyuv-tabulated matrix/range");
+    check_rgba_destination(
+        bgra,
+        bgra_stride,
+        image.width,
+        image.height,
+        YuvSourceChannels::Bgra.get_channels_count(),
+    )?;
+    image.check_constraints(YuvChromaSubsampling::Yuv420)?;
+    crate::loongarch64::rgba_to_nv12_8::<
+        { YuvSourceChannels::Bgra as u8 },
+        { YuvNVOrder::UV as u8 },
+    >(image, bgra, bgra_stride, &c, backend);
+    Ok(())
+}
+
 fn rgbx_to_nv<const ORIGIN_CHANNELS: u8, const UV_ORDER: u8, const SAMPLING: u8>(
     image: &mut YuvBiPlanarImageMut<u8>,
     rgba: &[u8],
@@ -1471,6 +1623,33 @@ pub fn bgra_to_yuv_nv12(
     matrix: YuvStandardMatrix,
     mode: YuvConversionMode,
 ) -> Result<(), YuvError> {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let _ = mode;
+        if let Some(c) = crate::loongarch64::coeffs8(matrix, range) {
+            if std::arch::is_loongarch_feature_detected!("lsx") {
+                check_rgba_destination(
+                    bgra,
+                    bgra_stride,
+                    bi_planar_image.width,
+                    bi_planar_image.height,
+                    YuvSourceChannels::Bgra.get_channels_count(),
+                )?;
+                bi_planar_image.check_constraints(YuvChromaSubsampling::Yuv420)?;
+                crate::loongarch64::rgba_to_nv12_8::<
+                    { YuvSourceChannels::Bgra as u8 },
+                    { YuvNVOrder::UV as u8 },
+                >(
+                    bi_planar_image,
+                    bgra,
+                    bgra_stride,
+                    &c,
+                    crate::loongarch64::Simd8::Auto,
+                );
+                return Ok(());
+            }
+        }
+    }
     rgbx_to_nv::<
         { YuvSourceChannels::Bgra as u8 },
         { YuvNVOrder::UV as u8 },

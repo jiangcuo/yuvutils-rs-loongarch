@@ -58,6 +58,8 @@ geometry = ["dep:fast_transpose"]
 rdp = []
 # Enables YCgCo-Re/YCgCo-Ro support
 ycgco_r_type = []
+# Exposes LoongArch-only benchmark helpers for forcing scalar/LSX/LASX rows.
+loongarch_bench = []
 
 [package.metadata.docs.rs]
 # To build locally:

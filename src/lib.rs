@@ -63,6 +63,9 @@
     feature(stdarch_x86_avx512)
 )]
 #![cfg_attr(feature = "nightly_f16", feature(f16))]
+#![cfg_attr(target_arch = "loongarch64", feature(is_loongarch_feature_detected))]
+#![cfg_attr(target_arch = "loongarch64", feature(portable_simd))]
+#![cfg_attr(target_arch = "loongarch64", feature(stdarch_loongarch))]
 #![cfg_attr(
     all(
         feature = "nightly_i8mm",
@@ -101,6 +104,19 @@ mod from_identity_f16;
 mod geometry;
 mod images;
 mod internals;
+#[cfg(target_arch = "loongarch64")]
+mod loongarch64;
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_bench"))]
+#[doc(hidden)]
+pub mod loongarch64_bench {
+    pub use crate::loongarch64::{has_lasx, has_lsx};
+    pub use crate::rgba_to_nv::{
+        bgra_to_yuv_nv12_lasx, bgra_to_yuv_nv12_lsx, bgra_to_yuv_nv12_scalar,
+    };
+    pub use crate::rgba_to_yuv::{
+        bgra_to_yuv420_lasx, bgra_to_yuv420_lsx, bgra_to_yuv420_scalar,
+    };
+}
 #[cfg(feature = "geometry")]
 #[cfg_attr(docsrs, doc(cfg(feature = "geometry")))]
 mod mirroring;
@@ -632,3 +648,83 @@ pub use yuv_p16_to_rgba16_bilinear::{
     i214_to_rgb14_bilinear, i214_to_rgba14_bilinear, i216_to_rgb16_bilinear,
     i216_to_rgba16_bilinear, i414_to_rgb14_bilinear, i414_to_rgba14_bilinear,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_bgra(width: u32, height: u32) -> Vec<u8> {
+        let mut bgra = vec![0u8; width as usize * height as usize * 4];
+        for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
+            px[0] = (i * 17) as u8;
+            px[1] = (i * 31 + 7) as u8;
+            px[2] = (i * 47 + 11) as u8;
+            px[3] = 255;
+        }
+        bgra
+    }
+
+    #[test]
+    fn bgra_to_yuv420_hot_path_smoke() {
+        let width = 34;
+        let height = 18;
+        let bgra = test_bgra(width, height);
+        let mut y = vec![0u8; width as usize * height as usize];
+        let mut u = vec![0u8; (width as usize / 2) * (height as usize / 2)];
+        let mut v = vec![0u8; (width as usize / 2) * (height as usize / 2)];
+        let mut image = YuvPlanarImageMut {
+            y_plane: BufferStoreMut::Borrowed(&mut y),
+            y_stride: width,
+            u_plane: BufferStoreMut::Borrowed(&mut u),
+            u_stride: width / 2,
+            v_plane: BufferStoreMut::Borrowed(&mut v),
+            v_stride: width / 2,
+            width,
+            height,
+        };
+
+        bgra_to_yuv420(
+            &mut image,
+            &bgra,
+            width * 4,
+            YuvRange::Limited,
+            YuvStandardMatrix::Bt601,
+            YuvConversionMode::Balanced,
+        )
+        .unwrap();
+
+        assert!(y.iter().any(|v| *v != 0));
+        assert!(u.iter().any(|v| *v != 0));
+        assert!(v.iter().any(|v| *v != 0));
+    }
+
+    #[test]
+    fn bgra_to_yuv_nv12_hot_path_smoke() {
+        let width = 34;
+        let height = 18;
+        let bgra = test_bgra(width, height);
+        let mut y = vec![0u8; width as usize * height as usize];
+        let mut uv = vec![0u8; width as usize * (height as usize / 2)];
+        let mut image = YuvBiPlanarImageMut {
+            y_plane: BufferStoreMut::Borrowed(&mut y),
+            y_stride: width,
+            uv_plane: BufferStoreMut::Borrowed(&mut uv),
+            uv_stride: width,
+            width,
+            height,
+        };
+
+        bgra_to_yuv_nv12(
+            &mut image,
+            &bgra,
+            width * 4,
+            YuvRange::Limited,
+            YuvStandardMatrix::Bt601,
+            YuvConversionMode::Balanced,
+        )
+        .unwrap();
+
+        assert!(y.iter().any(|v| *v != 0));
+        assert!(uv.iter().any(|v| *v != 0));
+    }
+}
